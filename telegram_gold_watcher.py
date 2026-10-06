@@ -12,7 +12,7 @@ pytesseract.pytesseract.tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tess
 
 CHANNEL = "keydropcomofficial"
 CHANNEL_URL = "https://t.me/s/" + CHANNEL
-POLL_SECONDS = 60
+POLL_SECONDS = 300
 CODE_RE = re.compile(r"\b[A-Z0-9]{12,24}\b")
 
 
@@ -85,8 +85,24 @@ class TelegramGoldWatcher:
             return
         newest_id = posts[-1][0]
         if self.last_post_id is None:
+            # İlk açılışta mevcut en son Golden Code gönderisini de işle.
             self.last_post_id = newest_id
+            golden_posts = [
+                p for p in posts
+                if "golden code" in p[1].lower() and p[2]
+            ]
             self.log("[GOLD] Telegram takibi hazır. Son gönderi #%s." % newest_id)
+            if golden_posts:
+                post_id, text, image_url = golden_posts[-1]
+                try:
+                    code = self._ocr(image_url)
+                    if code and code not in self.seen_codes:
+                        self.seen_codes.add(code)
+                        self.code_callback(code, post_id)
+                    elif not code:
+                        self.log("[GOLD] #%s görselinde kod okunamadı." % post_id)
+                except Exception as exc:
+                    self.log("[GOLD] OCR hatası #%s: %s" % (post_id, exc))
             return
 
         new_posts = [p for p in posts if p[0] > self.last_post_id]
@@ -108,7 +124,7 @@ class TelegramGoldWatcher:
 
     def run(self):
         self.running = True
-        self.log("[GOLD] Telegram arka planda 60 saniyede bir kontrol ediliyor.")
+        self.log("[GOLD] Telegram arka planda 300 saniyede bir kontrol ediliyor.")
         while self.running:
             try:
                 self.check_once()
