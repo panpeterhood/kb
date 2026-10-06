@@ -63,86 +63,110 @@ class TelegramGoldWatcher:
         original = Image.open(io.BytesIO(response.content)).convert("L")
         w, h = original.size
 
-        # Golden Code farklı tasarımlarda farklı yüksekliklerde olabildiği için
-        # tam görsel + yatay bölgeleri ayrı ayrı deniyoruz.
         crops = [
             original,
-            original.crop((0, int(h * 0.20), w, int(h * 0.80))),
-            original.crop((0, int(h * 0.35), w, int(h * 0.75))),
+            original.crop((0, int(h * 0.15), w, int(h * 0.85))),
+            original.crop((0, int(h * 0.30), w, int(h * 0.78))),
+            original.crop((0, int(h * 0.40), w, int(h * 0.72))),
             original.crop((0, int(h * 0.45), w, h)),
         ]
+        configs = ["--psm 6", "--psm 11", "--psm 7", "--psm 13"]
+        votes = {}
 
-        texts = []
-        configs = [
-            "--psm 6",
-            "--psm 11",
-            "--psm 7",
-            "--psm 13",
-        ]
+        def add_candidate(value):
+            value = re.sub(r"[^A-Z0-9]", "", value.upper())
+            if not (12 <= len(value) <= 24):
+                return
+            if not any(ch.isalpha() for ch in value) or not any(ch.isdigit() for ch in value):
+                return
+            if "GOLDEN" in value or "KEYDROP" in value:
+                return
+            votes[value] = votes.get(value, 0) + 1
 
         for crop in crops:
             base = ImageOps.autocontrast(crop)
-            enlarged = base.resize((base.width * 3, base.height * 3))
+            for scale in (2, 3, 4):
+                enlarged = base.resize((base.width * scale, base.height * scale))
+                contrast = ImageEnhance.Contrast(enlarged).enhance(2.5)
+                variants = [
+                    enlarged,
+                    contrast,
+                    contrast.point(lambda p: 255 if p > 115 else 0),
+                    contrast.point(lambda p: 255 if p > 145 else 0),
+                    contrast.point(lambda p: 255 if p > 175 else 0),
+                    ImageOps.invert(contrast),
+                ]
+                for variant in variants:
+                    for psm in configs:
+                        try:
+                            text = pytesseract.image_to_string(
+                                variant,
+                                config=(
+                                    psm
+                                    + " -c tessedit_char_whitelist="
+                                    + "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+                                ),
+                            ).upper()
+                        except Exception:
+                            continue
 
-            # Birden fazla ön işleme varyasyonu.
-            variants = [
-                enlarged,
-                ImageEnhance.Contrast(enlarged).enhance(2.5),
-                enlarged.point(lambda p: 255 if p > 145 else 0),
-                enlarged.point(lambda p: 255 if p > 180 else 0),
-                ImageOps.invert(enlarged),
-            ]
+                        for match in CODE_RE.findall(text):
+                            add_candidate(match)
+                        for line in text.splitlines():
+                            add_candidate(line)
 
-            for variant in variants:
-                for psm in configs:
-                    try:
-                        text = pytesseract.image_to_string(
-                            variant,
-                            config=(
-                                psm
-                                + " -c tessedit_char_whitelist="
-                                + "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-                            ),
-                        ).upper()
-                        if text.strip():
-                            texts.append(text)
-                    except Exception:
-                        continue
-
-        # Önce Tesseract'ın doğal olarak tek parça okuduğu adayları topla.
-        candidates = []
-        for text in texts:
-            candidates.extend(CODE_RE.findall(text))
-
-            # OCR karakterler arasına boşluk koyduysa satırı birleştirip tekrar dene.
-            for line in text.splitlines():
-                compact = re.sub(r"[^A-Z0-9]", "", line.upper())
-                if 12 <= len(compact) <= 24:
-                    candidates.append(compact)
-
-        # Aynı adayın kaç farklı OCR denemesinde çıktığını da hesaba kat.
-        counts = {}
-        for value in candidates:
-            if (
-                any(ch.isalpha() for ch in value)
-                and any(ch.isdigit() for ch in value)
-                and "GOLDEN" not in value
-                and "KEYDROP" not in value
-            ):
-                counts[value] = counts.get(value, 0) + 1
-
-        if not counts:
-            preview = " | ".join(
-                re.sub(r"\\s+", " ", text).strip()[:80]
-                for text in texts[:4]
-                if text.strip()
-            )
-            if preview:
-                self.log("[GOLD][OCR DEBUG] Ham okuma: %s" % preview)
+        if not votes:
+            self.log("[GOLD][OCR] Uygun kod adayı bulunamadı.")
             return None
 
-        # Tekrarlanan OCR sonucu öncelikli; eşitlikte daha uzun aday seçilir.
-        return max(counts, key=lambda value: (counts[value], len(value)))
+        # Önce aynı uzunluktaki yakın sonuçları kümeliyoruz. Böylece örn.
+        # I/T, O/0, S/5 gibi tek-karakter OCR sapmaları consensus'a dahil olur.
+        by_length = {}
+        for value, count in votes.items():
+            by_length.setdefault(len(value), []).append((value, count))
+
+        def hamming(a, b):
+            return sum(x != y for x, y in zip(a, b))
+
+        best_seed = max(votes, key=lambda v: votes[v])
+        same_len = by_length[len(best_seed)]
+        cluster = [(v, n) for v, n in same_len if hamming(v, best_seed) <= 3]
+
+        # Karakter bazında ağırlıklı çoğunluk oyu.
+        consensus = []
+        confidences = []
+        for pos in range(len(best_seed)):
+            char_votes = {}
+            total = 0
+            for value, count in cluster:
+                ch = value[pos]
+                char_votes[ch] = char_votes.get(ch, 0) + count
+                total += count
+            ch, count = max(char_votes.items(), key=lambda item: item[1])
+            consensus.append(ch)
+            confidences.append(count / total if total else 0.0)
+
+        result = "".join(consensus)
+        support = sum(n for _, n in cluster)
+        min_conf = min(confidences) if confidences else 0.0
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
+
+        top = sorted(votes.items(), key=lambda item: item[1], reverse=True)[:5]
+        self.log(
+            "[GOLD][OCR] Adaylar: "
+            + ", ".join("%s x%s" % (value, count) for value, count in top)
+        )
+        self.log(
+            "[GOLD][OCR] Consensus=%s | destek=%s | min=%%%.0f | ort=%%%.0f"
+            % (result, support, min_conf * 100, avg_conf * 100)
+        )
+
+        # Şüpheli sonucu otomatik olarak panoya göndermiyoruz.
+        if support < 3 or min_conf < 0.60 or avg_conf < 0.78:
+            self.log("[GOLD][OCR] Güven seviyesi yetersiz; kod kabul edilmedi.")
+            return None
+
+        return result
 
     def check_once(self):
         posts = self._posts()
