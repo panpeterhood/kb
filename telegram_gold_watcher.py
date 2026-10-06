@@ -74,70 +74,56 @@ class TelegramGoldWatcher:
                 return
             if not any(ch.isalpha() for ch in value) or not any(ch.isdigit() for ch in value):
                 return
-            if "GOLDEN" in value or "KEYDROP" in value:
-                return
             item = candidates.setdefault(value, {"families": set(), "raw": 0})
             item["families"].add(family)
             item["raw"] += 1
 
-        # Golden Code görselleri sabit şablon kullanıyor. Kod, siyah yuvarlatılmış
-        # kutunun içinde ve yaklaşık olarak görselin x=%6-94, y=%69-91 bandında.
-        # Birkaç yakın crop kullanmak, Telegram yeniden ölçeklese bile tolerans sağlar.
+        # Golden Code şablonunda kodun bulunduğu siyah kutuya odaklan.
+        # Bir ana crop ve iki yakın tolerans crop'u yeterli.
         boxes = [
-            (0.05, 0.67, 0.95, 0.92),
-            (0.07, 0.70, 0.93, 0.90),
-            (0.10, 0.72, 0.90, 0.88),
+            (0.07, 0.69, 0.93, 0.91),
+            (0.10, 0.71, 0.90, 0.89),
+            (0.04, 0.67, 0.96, 0.93),
         ]
 
+        # Toplam 18 Tesseract çağrısı:
+        # 3 crop x 2 preprocessing x 3 PSM.
         for crop_i, (x1, y1, x2, y2) in enumerate(boxes):
             crop = rgb.crop((
                 int(w * x1), int(h * y1),
                 int(w * x2), int(h * y2),
             ))
+            gray = ImageOps.autocontrast(ImageOps.grayscale(crop))
+            enlarged = gray.resize(
+                (gray.width * 5, gray.height * 5),
+                Image.Resampling.LANCZOS,
+            )
+            contrast = ImageEnhance.Contrast(
+                ImageEnhance.Sharpness(enlarged).enhance(2.0)
+            ).enhance(2.5)
 
-            channels = {
-                "gray": ImageOps.grayscale(crop),
-                "r": crop.getchannel("R"),
-                "g": crop.getchannel("G"),
-            }
+            variants = [
+                ("contrast", contrast),
+                ("threshold", contrast.point(lambda p: 255 if p > 145 else 0)),
+            ]
 
-            for channel_name, channel in channels.items():
-                base = ImageOps.autocontrast(channel)
-
-                for scale in (4, 6):
-                    enlarged = base.resize(
-                        (base.width * scale, base.height * scale),
-                        Image.Resampling.LANCZOS,
-                    )
-                    sharp = ImageEnhance.Sharpness(enlarged).enhance(2.2)
-                    contrast = ImageEnhance.Contrast(sharp).enhance(2.4)
-
-                    variants = [
-                        ("plain", enlarged),
-                        ("contrast", contrast),
-                        ("thr100", contrast.point(lambda p: 255 if p > 100 else 0)),
-                        ("thr130", contrast.point(lambda p: 255 if p > 130 else 0)),
-                        ("thr160", contrast.point(lambda p: 255 if p > 160 else 0)),
-                        ("invert", ImageOps.invert(contrast)),
-                    ]
-
-                    for variant_name, variant in variants:
-                        for psm in (7, 8, 13):
-                            family = (crop_i, channel_name, scale, variant_name, psm)
-                            try:
-                                text = pytesseract.image_to_string(
-                                    variant,
-                                    config=(
-                                        f"--oem 1 --psm {psm} "
-                                        "-c tessedit_char_whitelist="
-                                        "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-                                    ),
-                                )
-                            except Exception:
-                                continue
-                            register(text, family)
-                            for match in CODE_RE.findall(text.upper()):
-                                register(match, family)
+            for variant_name, variant in variants:
+                for psm in (7, 8, 13):
+                    family = (crop_i, variant_name, psm)
+                    try:
+                        text = pytesseract.image_to_string(
+                            variant,
+                            config=(
+                                f"--oem 1 --psm {psm} "
+                                "-c tessedit_char_whitelist="
+                                "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+                            ),
+                        )
+                    except Exception:
+                        continue
+                    register(text, family)
+                    for match in CODE_RE.findall(text.upper()):
+                        register(match, family)
 
         if not candidates:
             self.log("[GOLD][OCR] Kod kutusunda uygun aday bulunamadı.")
@@ -177,19 +163,17 @@ class TelegramGoldWatcher:
             ", ".join(
                 "%s [aile=%s ham=%s skor=%.1f]"
                 % (value, len(info["families"]), info["raw"], score)
-                for score, value, info in ranked[:8]
+                for score, value, info in ranked[:6]
             )
         )
 
         top_score, top_value, top_info = ranked[0]
         top_families = len(top_info["families"])
-
-        # Kod kutusundan gelmesine rağmen tek/iki varyasyonda görünen sonucu kabul etme.
-        if top_families < 4:
+        if top_families < 3:
             self.log("[GOLD][OCR] Güven yetersiz; sonuç kabul edilmedi.")
             return None
 
-        # Aynı uzunluktaki yakın adayları karakter bazında oylat.
+        # Yakın ve aynı uzunluktaki adayları karakter bazında oylat.
         peers = []
         for score, value, info in ranked:
             if len(value) == len(top_value) and edit_distance(value, top_value) <= 2:
@@ -197,10 +181,8 @@ class TelegramGoldWatcher:
 
         final_chars = []
         confidences = []
-        ambiguity = []
-        confusing = [
-            {"O", "0"}, {"I", "1"}, {"S", "5"}, {"Z", "2"}, {"B", "8"}
-        ]
+        confusing = [{"O", "0"}, {"I", "1"}, {"S", "5"}, {"Z", "2"}, {"B", "8"}]
+        weak_ambiguous = []
 
         for pos in range(len(top_value)):
             votes = {}
@@ -208,42 +190,30 @@ class TelegramGoldWatcher:
                 ch = value[pos]
                 votes[ch] = votes.get(ch, 0) + weight
 
-            ordered = sorted(votes.items(), key=lambda item: item[1], reverse=True)
-            chosen, chosen_votes = ordered[0]
+            chosen, chosen_votes = max(votes.items(), key=lambda item: item[1])
             total = sum(votes.values())
             confidence = chosen_votes / total if total else 0.0
             final_chars.append(chosen)
             confidences.append(confidence)
 
             observed = set(votes)
-            if any(pair.issubset(observed) for pair in confusing):
-                ambiguity.append((pos + 1, votes, confidence))
+            if any(pair.issubset(observed) for pair in confusing) and confidence < 0.80:
+                weak_ambiguous.append(pos + 1)
 
-        final_value = "".join(final_chars)
-
-        # Özellikle O/0 gibi çiftlerde iki taraf da anlamlı destek alıyorsa
-        # tahmin yürütme; kodu reddet.
-        weak = [
-            pos for pos, votes, conf in ambiguity
-            if conf < 0.80
-        ]
-        if weak:
+        if weak_ambiguous:
             self.log(
                 "[GOLD][OCR] Karakter belirsizliği (pozisyon %s); sonuç kabul edilmedi."
-                % ", ".join(map(str, weak))
+                % ", ".join(map(str, weak_ambiguous))
             )
             return None
 
-        second_score = ranked[1][0] if len(ranked) > 1 else 0.0
-        margin = (top_score - second_score) / top_score if top_score else 1.0
-
+        final_value = "".join(final_chars)
         self.log(
-            "[GOLD][OCR] Seçilen=%s | aile=%s | min karakter=%%%s | skor farkı=%%%s"
+            "[GOLD][OCR] Seçilen=%s | aile=%s | min karakter=%%%s"
             % (
                 final_value,
                 top_families,
                 round(min(confidences) * 100) if confidences else 0,
-                round(margin * 100),
             )
         )
         return final_value
