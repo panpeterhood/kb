@@ -13,6 +13,8 @@ pytesseract.pytesseract.tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tess
 CHANNEL = "keydropcomofficial"
 CHANNEL_URL = "https://t.me/s/" + CHANNEL
 POLL_SECONDS = 300
+RETRY_SECONDS = 30
+HTTP_TIMEOUT = (30, 45)  # connect, read
 CODE_RE = re.compile(r"\b[A-Z0-9]{12,24}\b")
 
 
@@ -31,7 +33,7 @@ class TelegramGoldWatcher:
         self.running = False
 
     def _posts(self):
-        response = self.session.get(CHANNEL_URL, timeout=20)
+        response = self.session.get(CHANNEL_URL, timeout=HTTP_TIMEOUT)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
         posts = []
@@ -56,7 +58,7 @@ class TelegramGoldWatcher:
         return sorted(posts, key=lambda item: item[0])
 
     def _ocr(self, image_url):
-        response = self.session.get(image_url, timeout=20)
+        response = self.session.get(image_url, timeout=HTTP_TIMEOUT)
         response.raise_for_status()
         image = Image.open(io.BytesIO(response.content)).convert("L")
         w, h = image.size
@@ -122,15 +124,29 @@ class TelegramGoldWatcher:
             except Exception as exc:
                 self.log("[GOLD] OCR hatası #%s: %s" % (post_id, exc))
 
+    def _wait(self, seconds):
+        for _ in range(seconds):
+            if not self.running:
+                return False
+            time.sleep(1)
+        return self.running
+
     def run(self):
         self.running = True
         self.log("[GOLD] Telegram arka planda 300 saniyede bir kontrol ediliyor.")
         while self.running:
             try:
                 self.check_once()
+                wait_seconds = self.poll_seconds
+            except requests.RequestException as exc:
+                self.log(
+                    "[GOLD] Telegram bağlantı hatası: %s. 30 saniye sonra tekrar denenecek."
+                    % exc
+                )
+                wait_seconds = RETRY_SECONDS
             except Exception as exc:
                 self.log("[GOLD] Telegram kontrol hatası: %s" % exc)
-            for _ in range(self.poll_seconds):
-                if not self.running:
-                    return
-                time.sleep(1)
+                wait_seconds = RETRY_SECONDS
+
+            if not self._wait(wait_seconds):
+                return
