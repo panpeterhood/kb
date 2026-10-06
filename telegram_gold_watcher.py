@@ -60,26 +60,89 @@ class TelegramGoldWatcher:
     def _ocr(self, image_url):
         response = self.session.get(image_url, timeout=HTTP_TIMEOUT)
         response.raise_for_status()
-        image = Image.open(io.BytesIO(response.content)).convert("L")
-        w, h = image.size
-        variants = [image, image.crop((0, int(h * 0.45), w, h))]
-        candidates = []
-        for variant in variants:
-            variant = ImageOps.autocontrast(variant)
-            variant = ImageEnhance.Contrast(variant).enhance(2.0)
-            variant = variant.resize((variant.width * 2, variant.height * 2))
-            text = pytesseract.image_to_string(
-                variant,
-                config="--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-            ).upper()
-            candidates.extend(CODE_RE.findall(text))
-        valid = [
-            value for value in candidates
-            if any(c.isalpha() for c in value)
-            and any(c.isdigit() for c in value)
-            and "GOLDEN" not in value
+        original = Image.open(io.BytesIO(response.content)).convert("L")
+        w, h = original.size
+
+        # Golden Code farklı tasarımlarda farklı yüksekliklerde olabildiği için
+        # tam görsel + yatay bölgeleri ayrı ayrı deniyoruz.
+        crops = [
+            original,
+            original.crop((0, int(h * 0.20), w, int(h * 0.80))),
+            original.crop((0, int(h * 0.35), w, int(h * 0.75))),
+            original.crop((0, int(h * 0.45), w, h)),
         ]
-        return max(valid, key=len) if valid else None
+
+        texts = []
+        configs = [
+            "--psm 6",
+            "--psm 11",
+            "--psm 7",
+            "--psm 13",
+        ]
+
+        for crop in crops:
+            base = ImageOps.autocontrast(crop)
+            enlarged = base.resize((base.width * 3, base.height * 3))
+
+            # Birden fazla ön işleme varyasyonu.
+            variants = [
+                enlarged,
+                ImageEnhance.Contrast(enlarged).enhance(2.5),
+                enlarged.point(lambda p: 255 if p > 145 else 0),
+                enlarged.point(lambda p: 255 if p > 180 else 0),
+                ImageOps.invert(enlarged),
+            ]
+
+            for variant in variants:
+                for psm in configs:
+                    try:
+                        text = pytesseract.image_to_string(
+                            variant,
+                            config=(
+                                psm
+                                + " -c tessedit_char_whitelist="
+                                + "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+                            ),
+                        ).upper()
+                        if text.strip():
+                            texts.append(text)
+                    except Exception:
+                        continue
+
+        # Önce Tesseract'ın doğal olarak tek parça okuduğu adayları topla.
+        candidates = []
+        for text in texts:
+            candidates.extend(CODE_RE.findall(text))
+
+            # OCR karakterler arasına boşluk koyduysa satırı birleştirip tekrar dene.
+            for line in text.splitlines():
+                compact = re.sub(r"[^A-Z0-9]", "", line.upper())
+                if 12 <= len(compact) <= 24:
+                    candidates.append(compact)
+
+        # Aynı adayın kaç farklı OCR denemesinde çıktığını da hesaba kat.
+        counts = {}
+        for value in candidates:
+            if (
+                any(ch.isalpha() for ch in value)
+                and any(ch.isdigit() for ch in value)
+                and "GOLDEN" not in value
+                and "KEYDROP" not in value
+            ):
+                counts[value] = counts.get(value, 0) + 1
+
+        if not counts:
+            preview = " | ".join(
+                re.sub(r"\\s+", " ", text).strip()[:80]
+                for text in texts[:4]
+                if text.strip()
+            )
+            if preview:
+                self.log("[GOLD][OCR DEBUG] Ham okuma: %s" % preview)
+            return None
+
+        # Tekrarlanan OCR sonucu öncelikli; eşitlikte daha uzun aday seçilir.
+        return max(counts, key=lambda value: (counts[value], len(value)))
 
     def check_once(self):
         posts = self._posts()
