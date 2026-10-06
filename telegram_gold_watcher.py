@@ -7,6 +7,9 @@ from bs4 import BeautifulSoup
 from PIL import Image, ImageEnhance, ImageOps
 import pytesseract
 
+# Tesseract OCR executable (Windows)
+pytesseract.pytesseract.tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+
 CHANNEL = "keydropcomofficial"
 CHANNEL_URL = "https://t.me/s/" + CHANNEL
 POLL_SECONDS = 60
