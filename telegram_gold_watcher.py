@@ -366,6 +366,157 @@ class TelegramGoldWatcher:
                     "[GOLD][OCR] Turuncu kod yazısı renk maskesiyle bulunamadı."
                 )
 
+        # Tesseract bu fontta O ile 0'ı sistematik olarak karıştırabiliyor.
+        # Turuncu glyph'leri bağlı bileşenlere ayırıp şekil oranıyla ikinci,
+        # OCR'dan bağımsız bir kontrol yap. Bu fontta O belirgin biçimde daha
+        # geniş/yuvarlak, 0 ise daha dar.
+        if orange_points and any(ch in ("O", "0") for ch in final_chars):
+            orange_set = set(orange_points)
+            seen = set()
+            components = []
+
+            for point in orange_points:
+                if point in seen:
+                    continue
+                stack = [point]
+                seen.add(point)
+                xs = []
+                ys = []
+
+                while stack:
+                    px0, py0 = stack.pop()
+                    xs.append(px0)
+                    ys.append(py0)
+
+                    for nx in (px0 - 1, px0, px0 + 1):
+                        for ny in (py0 - 1, py0, py0 + 1):
+                            if nx == px0 and ny == py0:
+                                continue
+                            np = (nx, ny)
+                            if np in orange_set and np not in seen:
+                                seen.add(np)
+                                stack.append(np)
+
+                if len(xs) >= 8:
+                    components.append({
+                        "x1": min(xs),
+                        "x2": max(xs) + 1,
+                        "y1": min(ys),
+                        "y2": max(ys) + 1,
+                        "area": len(xs),
+                    })
+
+            # Çok küçük dekor/noise parçalarını at.
+            if components:
+                max_h = max(comp["y2"] - comp["y1"] for comp in components)
+                components = [
+                    comp for comp in components
+                    if (comp["y2"] - comp["y1"]) >= max_h * 0.65
+                    and comp["area"] >= 12
+                ]
+                components.sort(key=lambda comp: comp["x1"])
+
+            target_count = len(final_chars)
+
+            # Kerning nedeniyle iki harf birbirine değerse tek component olabilir.
+            # Geniş component'i dikey projeksiyondaki en zayıf noktadan böl.
+            while components and len(components) < target_count:
+                widths = [comp["x2"] - comp["x1"] for comp in components]
+                median_w = sorted(widths)[len(widths) // 2]
+                split_i = max(
+                    range(len(components)),
+                    key=lambda i: widths[i] / max(1, median_w),
+                )
+                comp = components[split_i]
+                width = comp["x2"] - comp["x1"]
+
+                if width < median_w * 1.45:
+                    break
+
+                lo = comp["x1"] + max(1, int(width * 0.30))
+                hi = comp["x1"] + min(width - 1, int(width * 0.70))
+                best_x = None
+                best_count = None
+
+                for sx in range(lo, hi + 1):
+                    count = sum(
+                        1 for yy in range(comp["y1"], comp["y2"])
+                        if (sx, yy) in orange_set
+                    )
+                    if best_count is None or count < best_count:
+                        best_count = count
+                        best_x = sx
+
+                if best_x is None:
+                    break
+
+                left_points = [
+                    (xx, yy) for xx, yy in orange_set
+                    if comp["x1"] <= xx < best_x
+                    and comp["y1"] <= yy < comp["y2"]
+                ]
+                right_points = [
+                    (xx, yy) for xx, yy in orange_set
+                    if best_x <= xx < comp["x2"]
+                    and comp["y1"] <= yy < comp["y2"]
+                ]
+
+                if not left_points or not right_points:
+                    break
+
+                def part_box(points):
+                    xvals = [p[0] for p in points]
+                    yvals = [p[1] for p in points]
+                    return {
+                        "x1": min(xvals),
+                        "x2": max(xvals) + 1,
+                        "y1": min(yvals),
+                        "y2": max(yvals) + 1,
+                        "area": len(points),
+                    }
+
+                components[split_i:split_i + 1] = [
+                    part_box(left_points),
+                    part_box(right_points),
+                ]
+                components.sort(key=lambda item: item["x1"])
+
+            if len(components) == target_count:
+                for pos, ch in enumerate(final_chars):
+                    if ch not in ("O", "0"):
+                        continue
+
+                    comp = components[pos]
+                    glyph_w = comp["x2"] - comp["x1"]
+                    glyph_h = comp["y2"] - comp["y1"]
+                    ratio = glyph_w / max(1, glyph_h)
+
+                    # Bu Golden Code fontunda ölçümler ölçekten bağımsız:
+                    # O yaklaşık >=1.0, 0 yaklaşık <=0.90 en/boy oranında.
+                    geometric = None
+                    if ratio >= 1.00:
+                        geometric = "O"
+                    elif ratio <= 0.90:
+                        geometric = "0"
+
+                    self.log(
+                        "[GOLD][OCR] Karakter %s O/0 geometri: oran=%.2f -> %s"
+                        % (
+                            pos + 1,
+                            ratio,
+                            geometric if geometric else "belirsiz",
+                        )
+                    )
+
+                    if geometric:
+                        final_chars[pos] = geometric
+                        confidences[pos] = max(confidences[pos], 0.95)
+            else:
+                self.log(
+                    "[GOLD][OCR] O/0 geometri atlandı: %s glyph / %s karakter."
+                    % (len(components), target_count)
+                )
+
         final_value = "".join(final_chars)
         min_conf = min(confidences) if confidences else 0.0
 
