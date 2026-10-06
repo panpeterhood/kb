@@ -64,148 +64,80 @@ class TelegramGoldWatcher:
         rgb = Image.open(io.BytesIO(response.content)).convert("RGB")
         w, h = rgb.size
 
-        # Doğruluk hızdan daha önemli: farklı kanal, crop, ölçek, rotasyon,
-        # kontrast ve threshold kombinasyonlarıyla bağımsız OCR aileleri oluştur.
-        crop_boxes = [
-            (0, 0, w, h),
-            (0, int(h * 0.12), w, int(h * 0.88)),
-            (0, int(h * 0.25), w, int(h * 0.82)),
-            (0, int(h * 0.35), w, int(h * 0.75)),
-            (0, int(h * 0.42), w, int(h * 0.70)),
-            (0, int(h * 0.45), w, h),
-        ]
-
-        psm_modes = (6, 7, 11, 12, 13)
-        rotations = (-1.2, -0.6, 0.0, 0.6, 1.2)
-        scales = (3, 4, 5)
-
-        # candidate -> {"raw": int, "families": set(), "confidence": float}
+        # İki aşamalı yaklaşım:
+        # 1) Az sayıda güçlü kombinasyonla adayları çıkar.
+        # 2) Sadece en iyi adayların çevresinde daha yoğun doğrulama yap.
         candidates = {}
 
-        def register_candidate(value, family, confidence=0.0):
-            value = re.sub(r"[^A-Z0-9]", "", value.upper())
+        def register(value, family, weight=1.0):
+            value = re.sub(r"[^A-Z0-9]", "", (value or "").upper())
             if not (12 <= len(value) <= 24):
                 return
-            if not any(ch.isalpha() for ch in value):
-                return
-            if not any(ch.isdigit() for ch in value):
+            if not any(ch.isalpha() for ch in value) or not any(ch.isdigit() for ch in value):
                 return
             if "GOLDEN" in value or "KEYDROP" in value:
                 return
-
-            item = candidates.setdefault(
-                value,
-                {"raw": 0, "families": set(), "confidence": 0.0}
-            )
-            item["raw"] += 1
+            item = candidates.setdefault(value, {"families": set(), "raw": 0, "weight": 0.0})
             item["families"].add(family)
-            item["confidence"] += max(0.0, float(confidence))
+            item["raw"] += 1
+            item["weight"] += weight
 
-        for crop_index, box in enumerate(crop_boxes):
-            crop_rgb = rgb.crop(box)
+        def run_ocr(image, family_prefix, psm_modes):
+            for psm in psm_modes:
+                family = family_prefix + (psm,)
+                try:
+                    text = pytesseract.image_to_string(
+                        image,
+                        config=(
+                            f"--oem 1 --psm {psm} "
+                            "-c tessedit_char_whitelist="
+                            "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+                        ),
+                    ).upper()
+                except Exception:
+                    continue
 
-            # RGB kanallarından biri, renkli arka planda yazıyı gri görüntüden
-            # çok daha net ayırabiliyor.
-            channel_images = {
-                "gray": ImageOps.grayscale(crop_rgb),
-                "r": crop_rgb.getchannel("R"),
-                "g": crop_rgb.getchannel("G"),
-                "b": crop_rgb.getchannel("B"),
+                for match in CODE_RE.findall(text):
+                    register(match, family)
+                for line in text.splitlines():
+                    register(line, family)
+
+        # Aşama 1: yaklaşık 70-100 OCR çağrısı.
+        stage1_boxes = [
+            (0, 0, w, h),
+            (0, int(h * 0.25), w, int(h * 0.82)),
+            (0, int(h * 0.38), w, int(h * 0.76)),
+            (0, int(h * 0.45), w, h),
+        ]
+
+        for crop_i, box in enumerate(stage1_boxes):
+            crop = rgb.crop(box)
+            channels = {
+                "gray": ImageOps.grayscale(crop),
+                "r": crop.getchannel("R"),
+                "g": crop.getchannel("G"),
+                "b": crop.getchannel("B"),
             }
-
-            for channel_name, channel in channel_images.items():
+            for channel_name, channel in channels.items():
                 base = ImageOps.autocontrast(channel)
-
-                for rotation in rotations:
-                    rotated = base.rotate(
-                        rotation,
-                        resample=Image.Resampling.BICUBIC,
-                        expand=False,
-                        fillcolor=255,
+                enlarged = base.resize(
+                    (base.width * 3, base.height * 3),
+                    Image.Resampling.LANCZOS,
+                )
+                contrast = ImageEnhance.Contrast(enlarged).enhance(2.6)
+                variants = {
+                    "contrast": contrast,
+                    "thr140": contrast.point(lambda p: 255 if p > 140 else 0),
+                }
+                for variant_name, variant in variants.items():
+                    run_ocr(
+                        variant,
+                        ("s1", crop_i, channel_name, variant_name),
+                        (6, 7, 11),
                     )
 
-                    for scale in scales:
-                        enlarged = rotated.resize(
-                            (rotated.width * scale, rotated.height * scale),
-                            Image.Resampling.LANCZOS,
-                        )
-                        sharp = ImageEnhance.Sharpness(enlarged).enhance(2.0)
-                        contrast = ImageEnhance.Contrast(sharp).enhance(2.8)
-
-                        variants = {
-                            "base": enlarged,
-                            "contrast": contrast,
-                            "thr110": contrast.point(lambda p: 255 if p > 110 else 0),
-                            "thr135": contrast.point(lambda p: 255 if p > 135 else 0),
-                            "thr160": contrast.point(lambda p: 255 if p > 160 else 0),
-                            "thr185": contrast.point(lambda p: 255 if p > 185 else 0),
-                            "invert": ImageOps.invert(contrast),
-                        }
-
-                        for variant_name, variant in variants.items():
-                            # Aynı görsel varyasyonundaki PSM sonuçlarını tek
-                            # bağımsız aile sayıyoruz; böylece aynı OCR hatası
-                            # yüzlerce kez tekrar edip sahte güven yaratmaz.
-                            family = (
-                                crop_index,
-                                channel_name,
-                                round(rotation, 1),
-                                scale,
-                                variant_name,
-                            )
-
-                            for psm in psm_modes:
-                                config = (
-                                    f"--oem 1 --psm {psm} "
-                                    "-c tessedit_char_whitelist="
-                                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 "
-                                    "-c preserve_interword_spaces=1"
-                                )
-
-                                try:
-                                    data = pytesseract.image_to_data(
-                                        variant,
-                                        config=config,
-                                        output_type=pytesseract.Output.DICT,
-                                    )
-                                except Exception:
-                                    continue
-
-                                line_parts = {}
-                                line_conf = {}
-
-                                for i, text in enumerate(data.get("text", [])):
-                                    text = (text or "").strip().upper()
-                                    if not text:
-                                        continue
-
-                                    try:
-                                        conf = float(data["conf"][i])
-                                    except Exception:
-                                        conf = 0.0
-
-                                    register_candidate(text, family, conf)
-
-                                    key = (
-                                        data["block_num"][i],
-                                        data["par_num"][i],
-                                        data["line_num"][i],
-                                    )
-                                    line_parts.setdefault(key, []).append(text)
-                                    line_conf.setdefault(key, []).append(conf)
-
-                                # Tesseract kodun arasına boşluk koyarsa satırı
-                                # birleştirerek de aday üret.
-                                for key, parts in line_parts.items():
-                                    joined = "".join(parts)
-                                    confs = [x for x in line_conf.get(key, []) if x >= 0]
-                                    avg_conf = (
-                                        sum(confs) / len(confs) if confs else 0.0
-                                    )
-                                    register_candidate(joined, family, avg_conf)
-
         if not candidates:
-            self.log("[GOLD][OCR] Uygun kod adayı bulunamadı.")
+            self.log("[GOLD][OCR] İlk aşamada kod adayı bulunamadı.")
             return None
 
         def edit_distance(a, b):
@@ -221,80 +153,111 @@ class TelegramGoldWatcher:
                 previous = current
             return previous[-1]
 
-        # Skorun ana bileşeni bağımsız görüntü ailelerinin sayısı.
-        # raw tekrarlar yalnızca küçük tie-breaker; OCR confidence da yardımcı.
+        def base_score(value, info):
+            return len(info["families"]) * 10.0 + min(info["raw"], 20) * 0.25 + info["weight"] * 0.05
+
+        stage1_ranked = sorted(
+            candidates.items(),
+            key=lambda item: base_score(item[0], item[1]),
+            reverse=True,
+        )
+        seeds = [value for value, _ in stage1_ranked[:6]]
+
+        # Aşama 2: farklı ölçek/rotasyon/threshold ile doğrulama.
+        focus_boxes = [
+            (0, int(h * 0.28), w, int(h * 0.82)),
+            (0, int(h * 0.36), w, int(h * 0.76)),
+            (0, int(h * 0.42), w, int(h * 0.72)),
+        ]
+
+        for crop_i, box in enumerate(focus_boxes):
+            crop = rgb.crop(box)
+            for channel_name, channel in {
+                "gray": ImageOps.grayscale(crop),
+                "r": crop.getchannel("R"),
+                "g": crop.getchannel("G"),
+                "b": crop.getchannel("B"),
+            }.items():
+                base = ImageOps.autocontrast(channel)
+
+                for rotation in (-0.8, 0.0, 0.8):
+                    rotated = base.rotate(
+                        rotation,
+                        resample=Image.Resampling.BICUBIC,
+                        expand=False,
+                        fillcolor=255,
+                    )
+                    enlarged = rotated.resize(
+                        (rotated.width * 4, rotated.height * 4),
+                        Image.Resampling.LANCZOS,
+                    )
+                    contrast = ImageEnhance.Contrast(
+                        ImageEnhance.Sharpness(enlarged).enhance(2.0)
+                    ).enhance(2.8)
+
+                    for threshold in (120, 150, 180):
+                        variant = contrast.point(
+                            lambda p, t=threshold: 255 if p > t else 0
+                        )
+                        run_ocr(
+                            variant,
+                            ("s2", crop_i, channel_name, rotation, threshold),
+                            (7, 11, 13),
+                        )
+
+        # Nihai skor: bağımsız aile desteği + edit-distance komşu desteği.
         ranked = []
         for value, info in candidates.items():
-            family_count = len(info["families"])
-            raw = info["raw"]
-            conf = info["confidence"]
-
-            # Yakın adaylardan gelen destek. Farklı uzunluktaki fakat 1-2 karakter
-            # ekleme/silme içeren okumalar da burada hesaba girer.
-            neighbor_support = 0.0
+            families = len(info["families"])
+            neighbor = 0.0
             for other, other_info in candidates.items():
                 if other == value:
                     continue
                 dist = edit_distance(value, other)
-                if dist <= 1:
-                    neighbor_support += len(other_info["families"]) * 0.35
+                if dist == 1:
+                    neighbor += len(other_info["families"]) * 1.2
                 elif dist == 2:
-                    neighbor_support += len(other_info["families"]) * 0.12
+                    neighbor += len(other_info["families"]) * 0.35
 
-            score = (
-                family_count * 10.0
-                + neighbor_support
-                + min(raw, 20) * 0.20
-                + min(conf / 100.0, 20.0) * 0.05
-            )
+            seed_bonus = 2.0 if any(edit_distance(value, seed) <= 1 for seed in seeds) else 0.0
+            score = families * 10.0 + neighbor + seed_bonus + min(info["raw"], 30) * 0.15
             ranked.append((score, value, info))
 
         ranked.sort(reverse=True, key=lambda item: item[0])
 
-        # Debug için ilk 8 adayın bağımsız aile ve ham tekrar sayısını göster.
-        debug_items = []
-        for score, value, info in ranked[:8]:
-            debug_items.append(
+        self.log(
+            "[GOLD][OCR] Adaylar: " +
+            ", ".join(
                 "%s [aile=%s ham=%s skor=%.1f]"
                 % (value, len(info["families"]), info["raw"], score)
+                for score, value, info in ranked[:8]
             )
-        self.log("[GOLD][OCR] Adaylar: " + ", ".join(debug_items))
-
-        top_score, top_value, top_info = ranked[0]
-        second_score = ranked[1][0] if len(ranked) > 1 else 0.0
-        top_families = len(top_info["families"])
-        margin = (
-            (top_score - second_score) / top_score
-            if top_score > 0 else 0.0
         )
 
-        # Doğruluk öncelikli: zayıf/kararsız sonucu otomatik kopyalamıyoruz.
-        # En iyi aday en az 4 bağımsız görüntü ailesinde görünmeli.
+        top_score, top_value, top_info = ranked[0]
+        top_families = len(top_info["families"])
+
         if top_families < 4:
-            self.log(
-                "[GOLD][OCR] Güven yetersiz: en iyi aday yalnızca %s bağımsız ailede."
-                % top_families
-            )
+            self.log("[GOLD][OCR] Güven yetersiz; sonuç kabul edilmedi.")
             return None
 
-        # Birbirine çok yakın iki farklı aday varsa ve skor farkı küçükse,
-        # yanlış kodu panoya göndermek yerine reddet.
         if len(ranked) > 1:
-            _, second_value, second_info = ranked[1]
+            second_score, second_value, second_info = ranked[1]
+            margin = (top_score - second_score) / top_score if top_score else 0.0
             distance = edit_distance(top_value, second_value)
-            second_families = len(second_info["families"])
 
             if (
                 distance <= 2
-                and second_families >= max(3, int(top_families * 0.55))
-                and margin < 0.18
+                and len(second_info["families"]) >= max(3, int(top_families * 0.55))
+                and margin < 0.12
             ):
                 self.log(
-                    "[GOLD][OCR] Belirsiz sonuç: %s ile %s birbirine çok yakın; "
-                    "yanlış kod riskinden dolayı kabul edilmedi."
+                    "[GOLD][OCR] Belirsiz: %s / %s. Yanlış kod riskinden dolayı kabul edilmedi."
                     % (top_value, second_value)
                 )
                 return None
+        else:
+            margin = 1.0
 
         self.log(
             "[GOLD][OCR] Seçilen=%s | bağımsız aile=%s | skor farkı=%%%s"
