@@ -200,20 +200,122 @@ class TelegramGoldWatcher:
             if any(pair.issubset(observed) for pair in confusing) and confidence < 0.80:
                 weak_ambiguous.append(pos + 1)
 
-        if weak_ambiguous:
+        # Düşük güvenli pozisyonları karakter seviyesinde yeniden oku.
+        # Ana crop'taki kod satırını eşit karakter hücrelerine bölüp yalnızca
+        # şüpheli karakterleri daha yüksek çözünürlükte oyluyoruz.
+        refine_positions = {
+            i for i, conf in enumerate(confidences) if conf < 0.80
+        }
+        refine_positions.update(pos - 1 for pos in weak_ambiguous)
+
+        if refine_positions and len(top_value) >= 12:
+            # En dar crop, kod metnine en az dekor karıştıran bölge.
+            x1, y1, x2, y2 = boxes[1]
+            code_crop = rgb.crop((
+                int(w * x1), int(h * y1),
+                int(w * x2), int(h * y2),
+            ))
+            cw, ch = code_crop.size
+
+            # Siyah kutunun crop içindeki yatay kenar boşluklarını azalt.
+            left_pad = int(cw * 0.055)
+            right_pad = int(cw * 0.055)
+            usable_left = left_pad
+            usable_right = max(usable_left + 1, cw - right_pad)
+            cell_w = (usable_right - usable_left) / len(top_value)
+
+            for pos in sorted(refine_positions):
+                cx1 = max(0, int(usable_left + (pos - 0.35) * cell_w))
+                cx2 = min(cw, int(usable_left + (pos + 1.35) * cell_w))
+                char_crop = code_crop.crop((cx1, 0, cx2, ch))
+
+                char_votes = {}
+                char_channels = {
+                    "gray": ImageOps.grayscale(char_crop),
+                    "r": char_crop.getchannel("R"),
+                    "g": char_crop.getchannel("G"),
+                }
+
+                for channel_name, channel in char_channels.items():
+                    base = ImageOps.autocontrast(channel)
+                    enlarged = base.resize(
+                        (base.width * 10, base.height * 10),
+                        Image.Resampling.LANCZOS,
+                    )
+                    contrast = ImageEnhance.Contrast(
+                        ImageEnhance.Sharpness(enlarged).enhance(2.5)
+                    ).enhance(3.0)
+
+                    variants = [
+                        contrast,
+                        contrast.point(lambda p: 255 if p > 110 else 0),
+                        contrast.point(lambda p: 255 if p > 140 else 0),
+                        contrast.point(lambda p: 255 if p > 170 else 0),
+                        ImageOps.invert(contrast),
+                    ]
+
+                    for variant in variants:
+                        for psm in (10, 13):
+                            try:
+                                raw = pytesseract.image_to_string(
+                                    variant,
+                                    config=(
+                                        f"--oem 1 --psm {psm} "
+                                        "-c tessedit_char_whitelist="
+                                        "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+                                    ),
+                                )
+                            except Exception:
+                                continue
+
+                            value = clean(raw)
+                            # Hücre biraz komşu karakter içerirse, mevcut adayın
+                            # karakterine en yakın tek-karakter okumayı kullan.
+                            if len(value) == 1:
+                                char_votes[value] = char_votes.get(value, 0) + 1
+
+                if char_votes:
+                    ordered = sorted(
+                        char_votes.items(), key=lambda item: item[1], reverse=True
+                    )
+                    chosen, chosen_votes = ordered[0]
+                    total = sum(char_votes.values())
+                    refined_conf = chosen_votes / total if total else 0.0
+
+                    self.log(
+                        "[GOLD][OCR] Karakter %s yeniden okuma: %s | güven=%%%s | oy=%s"
+                        % (
+                            pos + 1,
+                            chosen,
+                            round(refined_conf * 100),
+                            "/".join("%s:%s" % item for item in ordered[:4]),
+                        )
+                    )
+
+                    # Yalnızca güçlü karakter-level çoğunluk varsa ana sonucu değiştir.
+                    if refined_conf >= 0.75 and chosen != final_chars[pos]:
+                        final_chars[pos] = chosen
+                        confidences[pos] = refined_conf
+                    elif refined_conf >= 0.75:
+                        confidences[pos] = max(confidences[pos], refined_conf)
+
+        final_value = "".join(final_chars)
+        min_conf = min(confidences) if confidences else 0.0
+
+        # Düşük güvenli kodu panoya göndermiyoruz.
+        if min_conf < 0.80:
             self.log(
-                "[GOLD][OCR] Karakter belirsizliği (pozisyon %s); sonuç kabul edilmedi."
-                % ", ".join(map(str, weak_ambiguous))
+                "[GOLD][OCR] Nihai karakter güveni düşük (min=%%%s); sonuç kabul edilmedi."
+                % round(min_conf * 100)
             )
             return None
 
-        final_value = "".join(final_chars)
         self.log(
             "[GOLD][OCR] Seçilen=%s | aile=%s | min karakter=%%%s"
             % (
                 final_value,
                 top_families,
-                round(min(confidences) * 100) if confidences else 0,
+                round(min_conf * 100),
             )
         )
         return final_value
