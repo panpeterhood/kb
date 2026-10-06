@@ -200,14 +200,15 @@ class TelegramGoldWatcher:
             if any(pair.issubset(observed) for pair in confusing) and confidence < 0.80:
                 weak_ambiguous.append(pos + 1)
 
-        # Düşük güvenli karakterlerin yanında OCR'ın sık karıştırdığı
-        # O/0, I/1, S/5, Z/2 ve B/8 karakterlerini de ayrıca doğrula.
+        # Düşük güvenli karakterleri ve OCR'ın sık karıştırdığı çiftleri
+        # kod satırının gerçek renkli glyph'lerinden ayrıca doğrula.
         pair_map = {
             "O": "O0", "0": "O0",
             "I": "I1", "1": "I1",
             "S": "S5", "5": "S5",
             "Z": "Z2", "2": "Z2",
             "B": "B8", "8": "B8",
+            "V": "VW", "W": "VW",
         }
 
         refine_positions = {
@@ -219,182 +220,151 @@ class TelegramGoldWatcher:
         )
 
         if refine_positions and len(top_value) >= 12:
-            # Kod satırının en temiz crop'u.
-            x1, y1, x2, y2 = boxes[1]
-            code_crop = rgb.crop((
-                int(w * x1), int(h * y1),
-                int(w * x2), int(h * y2),
-            ))
+            # Golden Code şablonunda yazı siyah kutunun içinde turuncu.
+            # Önce yalnızca bu satırın bulunabileceği güvenli bandı tara;
+            # turuncu glyph piksellerinin gerçek bounding box'ını bul.
+            search_left = int(w * 0.12)
+            search_right = int(w * 0.88)
+            search_top = int(h * 0.76)
+            search_bottom = int(h * 0.90)
 
-            # Önce Tesseract'ın gerçek karakter kutularını bulmaya çalış.
-            # Böylece eşit hücre tahmini yerine her glyph'in gerçek sınırını kullanırız.
-            box_scale = 6
-            locator = ImageOps.autocontrast(ImageOps.grayscale(code_crop))
-            locator = locator.resize(
-                (locator.width * box_scale, locator.height * box_scale),
-                Image.Resampling.LANCZOS,
-            )
-            locator = ImageEnhance.Contrast(locator).enhance(2.5)
+            band = rgb.crop((
+                search_left, search_top,
+                search_right, search_bottom,
+            )).convert("RGB")
 
-            box_variants = [
-                locator,
-                locator.point(lambda p: 255 if p > 120 else 0),
-                locator.point(lambda p: 255 if p > 145 else 0),
-                locator.point(lambda p: 255 if p > 170 else 0),
-            ]
+            orange_points = []
+            px = band.load()
+            for yy in range(band.height):
+                for xx in range(band.width):
+                    rr, gg, bb = px[xx, yy]
+                    # Turuncu kod yazısını seç; siyah kutu ve beyaz/dekor alanını at.
+                    if (
+                        rr > 170
+                        and 50 < gg < 220
+                        and bb < 120
+                        and rr > gg * 1.15
+                    ):
+                        orange_points.append((xx, yy))
 
-            best_boxes = None
-            best_box_distance = 999
+            if orange_points:
+                text_left = search_left + min(p[0] for p in orange_points)
+                text_right = search_left + max(p[0] for p in orange_points) + 1
+                text_top = search_top + min(p[1] for p in orange_points)
+                text_bottom = search_top + max(p[1] for p in orange_points) + 1
 
-            for box_variant in box_variants:
-                try:
-                    raw_boxes = pytesseract.image_to_boxes(
-                        box_variant,
-                        config=(
-                            "--oem 1 --psm 7 "
-                            "-c tessedit_char_whitelist="
-                            "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-                        ),
-                    )
-                except Exception:
-                    continue
-
-                parsed = []
-                for line in raw_boxes.splitlines():
-                    parts = line.split()
-                    if len(parts) < 5:
-                        continue
-                    ch = clean(parts[0])
-                    if len(ch) != 1:
-                        continue
-                    try:
-                        bx1, by1, bx2, by2 = map(int, parts[1:5])
-                    except Exception:
-                        continue
-                    parsed.append((ch, bx1, by1, bx2, by2))
-
-                parsed.sort(key=lambda item: item[1])
-                recognized = "".join(item[0] for item in parsed)
-
-                if len(parsed) == len(top_value):
-                    dist = edit_distance(recognized, top_value)
-                    if dist < best_box_distance:
-                        best_box_distance = dist
-                        best_boxes = parsed
-
-            if best_boxes:
                 self.log(
-                    "[GOLD][OCR] Karakter kutuları bulundu: %s/%s"
-                    % (len(best_boxes), len(top_value))
+                    "[GOLD][OCR] Kod yazısı renk maskesiyle bulundu: "
+                    "x=%s-%s y=%s-%s"
+                    % (text_left, text_right, text_top, text_bottom)
                 )
+
+                cell_w = (text_right - text_left) / len(top_value)
+
+                for pos in sorted(refine_positions):
+                    current_char = final_chars[pos]
+                    whitelist = pair_map.get(
+                        current_char,
+                        "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+                    )
+                    char_votes = {}
+
+                    # Tek bir crop'a güvenme. Aynı glyph'i çok az değişen
+                    # yatay paddinglerle tekrar oku.
+                    for pad in (0.00, 0.04, 0.08, 0.12):
+                        cx1 = max(
+                            0,
+                            int(text_left + (pos - pad) * cell_w),
+                        )
+                        cx2 = min(
+                            w,
+                            int(text_left + (pos + 1 + pad) * cell_w),
+                        )
+                        cy1 = max(0, text_top - 4)
+                        cy2 = min(h, text_bottom + 4)
+
+                        char_rgb = rgb.crop((cx1, cy1, cx2, cy2)).convert("RGB")
+
+                        # Arka planı tamamen kaldır: yalnızca turuncu glyph siyah,
+                        # geri kalan her şey beyaz. Bu, O/0 gibi ayrımlarda
+                        # Tesseract'ın kutu kenarlarını harf sanmasını engeller.
+                        binary = Image.new("L", char_rgb.size, 255)
+                        src = char_rgb.load()
+                        dst = binary.load()
+
+                        for yy in range(char_rgb.height):
+                            for xx in range(char_rgb.width):
+                                rr, gg, bb = src[xx, yy]
+                                if (
+                                    rr > 170
+                                    and 50 < gg < 220
+                                    and bb < 120
+                                    and rr > gg * 1.15
+                                ):
+                                    dst[xx, yy] = 0
+
+                        binary = binary.resize(
+                            (binary.width * 12, binary.height * 12),
+                            Image.Resampling.NEAREST,
+                        )
+
+                        for psm in (10, 13):
+                            try:
+                                raw = pytesseract.image_to_string(
+                                    binary,
+                                    config=(
+                                        f"--oem 1 --psm {psm} "
+                                        f"-c tessedit_char_whitelist={whitelist}"
+                                    ),
+                                )
+                            except Exception:
+                                continue
+
+                            value = clean(raw)
+                            if len(value) == 1:
+                                char_votes[value] = char_votes.get(value, 0) + 1
+
+                    if not char_votes:
+                        self.log(
+                            "[GOLD][OCR] Karakter %s yeniden okunamadı."
+                            % (pos + 1)
+                        )
+                        continue
+
+                    ordered = sorted(
+                        char_votes.items(),
+                        key=lambda item: item[1],
+                        reverse=True,
+                    )
+                    chosen, chosen_votes = ordered[0]
+                    total = sum(char_votes.values())
+                    refined_conf = chosen_votes / total if total else 0.0
+
+                    self.log(
+                        "[GOLD][OCR] Karakter %s yeniden okuma: %s | "
+                        "güven=%%%s | oy=%s"
+                        % (
+                            pos + 1,
+                            chosen,
+                            round(refined_conf * 100),
+                            "/".join(
+                                "%s:%s" % item for item in ordered[:4]
+                            ),
+                        )
+                    )
+
+                    # En az iki başarılı tek-karakter okuması ve güçlü çoğunluk
+                    # olmadan ana sonucu değiştirme.
+                    if chosen_votes >= 2 and refined_conf >= 0.75:
+                        final_chars[pos] = chosen
+                        confidences[pos] = max(
+                            confidences[pos],
+                            refined_conf,
+                        )
             else:
                 self.log(
-                    "[GOLD][OCR] Karakter kutuları bulunamadı; dar hücre fallback kullanılacak."
+                    "[GOLD][OCR] Turuncu kod yazısı renk maskesiyle bulunamadı."
                 )
-
-            lcw, lch = locator.size
-            cw, ch = code_crop.size
-
-            for pos in sorted(refine_positions):
-                # Öncelik: Tesseract'ın gerçek glyph bounding box'ı.
-                if best_boxes and pos < len(best_boxes):
-                    _, bx1, by1, bx2, by2 = best_boxes[pos]
-                    bw = max(1, bx2 - bx1)
-                    bh = max(1, by2 - by1)
-                    pad_x = max(2, int(bw * 0.12))
-                    pad_y = max(3, int(bh * 0.15))
-
-                    # image_to_boxes koordinatlarının Y ekseni alttan başlar.
-                    px1 = max(0, bx1 - pad_x)
-                    px2 = min(lcw, bx2 + pad_x)
-                    py1 = max(0, lch - by2 - pad_y)
-                    py2 = min(lch, lch - by1 + pad_y)
-                    char_crop = locator.crop((px1, py1, px2, py2))
-                else:
-                    # Fallback: önceki 1.7 karakterlik crop yerine yalnızca
-                    # yaklaşık tek karakter genişliği kullan.
-                    left_pad = int(cw * 0.055)
-                    right_pad = int(cw * 0.055)
-                    usable_left = left_pad
-                    usable_right = max(usable_left + 1, cw - right_pad)
-                    cell_w = (usable_right - usable_left) / len(top_value)
-                    cx1 = max(0, int(usable_left + (pos + 0.08) * cell_w))
-                    cx2 = min(cw, int(usable_left + (pos + 0.92) * cell_w))
-                    char_crop = code_crop.crop((cx1, 0, cx2, ch))
-                    char_crop = ImageOps.autocontrast(ImageOps.grayscale(char_crop))
-                    char_crop = char_crop.resize(
-                        (char_crop.width * 10, char_crop.height * 10),
-                        Image.Resampling.LANCZOS,
-                    )
-
-                char_votes = {}
-                current_char = final_chars[pos]
-                whitelist = pair_map.get(
-                    current_char,
-                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-                )
-
-                base = ImageOps.autocontrast(char_crop.convert("L"))
-                contrast = ImageEnhance.Contrast(
-                    ImageEnhance.Sharpness(base).enhance(2.5)
-                ).enhance(3.0)
-
-                variants = [
-                    contrast,
-                    contrast.point(lambda p: 255 if p > 105 else 0),
-                    contrast.point(lambda p: 255 if p > 130 else 0),
-                    contrast.point(lambda p: 255 if p > 155 else 0),
-                    contrast.point(lambda p: 255 if p > 180 else 0),
-                    ImageOps.invert(contrast),
-                ]
-
-                for variant_i, variant in enumerate(variants):
-                    for psm in (10, 13):
-                        try:
-                            raw = pytesseract.image_to_string(
-                                variant,
-                                config=(
-                                    f"--oem 1 --psm {psm} "
-                                    f"-c tessedit_char_whitelist={whitelist}"
-                                ),
-                            )
-                        except Exception:
-                            continue
-
-                        value = clean(raw)
-                        if len(value) == 1:
-                            char_votes[value] = char_votes.get(value, 0) + 1
-
-                if not char_votes:
-                    self.log(
-                        "[GOLD][OCR] Karakter %s yeniden okunamadı."
-                        % (pos + 1)
-                    )
-                    continue
-
-                ordered = sorted(
-                    char_votes.items(), key=lambda item: item[1], reverse=True
-                )
-                chosen, chosen_votes = ordered[0]
-                total = sum(char_votes.values())
-                refined_conf = chosen_votes / total if total else 0.0
-
-                self.log(
-                    "[GOLD][OCR] Karakter %s yeniden okuma: %s | güven=%%%s | oy=%s"
-                    % (
-                        pos + 1,
-                        chosen,
-                        round(refined_conf * 100),
-                        "/".join("%s:%s" % item for item in ordered[:4]),
-                    )
-                )
-
-                # Pair-specific OCR'da %70+, genel düşük-güven refinement'ta %75+
-                # çoğunluk varsa karakteri güncelle.
-                required_conf = 0.70 if current_char in pair_map else 0.75
-                if refined_conf >= required_conf:
-                    final_chars[pos] = chosen
-                    confidences[pos] = max(confidences[pos], refined_conf)
 
         final_value = "".join(final_chars)
         min_conf = min(confidences) if confidences else 0.0
